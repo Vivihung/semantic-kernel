@@ -127,7 +127,7 @@ public class BotController : ControllerBase
     /// </remarks>
     /// <param name="externalBotSchema">The external bot schemal.</param>
     /// <param name="externalBotEmbeddingConfig">The external bot embedding configuration.</param>
-    /// <returns></returns>
+    /// <returns>True if the external bot schema is compatible with the app; otherwise False.</returns>
     private bool IsBotCompatible(BotSchemaConfig externalBotSchema, BotEmbeddingConfig externalBotEmbeddingConfig)
     {
         var embeddingAIServiceConfig = this._configuration.GetSection("Embedding").Get<AIServiceConfig>();
