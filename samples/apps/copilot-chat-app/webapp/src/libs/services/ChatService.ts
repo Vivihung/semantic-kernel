@@ -134,7 +134,7 @@ export class ChatService extends BaseService {
 
         const result = await this.getResponseAsync<IAskResult>(
             {
-                commandPath: `chat`,
+                commandPath: `dispatch`,
                 method: 'POST',
                 body: ask,
             },
