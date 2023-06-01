@@ -1,15 +1,28 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.Graph;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Orchestration;
 using Microsoft.SemanticKernel.Planning;
+using Microsoft.SemanticKernel.Planning.Sequential;
+using Microsoft.SemanticKernel.Reliability;
+using Microsoft.SemanticKernel.SkillDefinition;
+using Microsoft.SemanticKernel.Skills.MsGraph;
+using Microsoft.SemanticKernel.Skills.MsGraph.Connectors;
+using Microsoft.SemanticKernel.Skills.MsGraph.Connectors.Client;
+using Microsoft.SemanticKernel.Skills.OpenAPI.Authentication;
 using SemanticKernel.Service.CopilotChat.Models;
 using SemanticKernel.Service.CopilotChat.Options;
 using SemanticKernel.Service.CopilotChat.Skills;
@@ -26,6 +39,8 @@ public class DispatchController : ControllerBase, IDisposable
     private readonly ILogger<DispatchController> _logger;
     private readonly IKernel _kernel;
     private readonly SequentialPlanner _planner;
+    private readonly MsGraphClientLoggingHandler _graphLoggingHandler;
+    private IList<DelegatingHandler>? _graphMiddlewareHandlers;
 
     public DispatchController(
         IKernel kernel,
@@ -47,18 +62,25 @@ public class DispatchController : ControllerBase, IDisposable
                     this._logger!);
         */
 
+        this._logger = logger;
+
+        // For MS Graph client
+        this._graphLoggingHandler = new(this._logger);
+
         this._kernel = new KernelBuilder()
-                .WithLogger(logger)
+                .WithLogger(this._logger)
                 .WithMemory(kernel.Memory)
                 .WithConfiguration(this.CreateKernelConfig(aiServiceOptions.Value))
                 .Build();
 
-        this._logger = logger;
-        this._planner = new SequentialPlanner(this._kernel);
+        this._planner = new SequentialPlanner(this._kernel, new SequentialPlannerConfig { RelevancyThreshold = 0.7 });
 
-        // import skills
+        // == Import skills ==
+        // Semantic skill
+        this._kernel.ImportSemanticSkillFromDirectory(Path.GetFullPath(Path.Combine(Path.GetFullPath(System.Reflection.Assembly.GetExecutingAssembly().Location), "..", "..", "..", "..", "..", "..", "..", "skills")), "SummarizeSkill", "WriterSkill");
+
         // Chat skill
-        this._kernel.ImportSkill(new ChatSkill(
+        /*this._kernel.ImportSkill(new ChatSkill(
                 kernel: kernel,
                 chatMessageRepository: chatMessageRepository,
                 chatSessionRepository: chatSessionRepository,
@@ -66,10 +88,13 @@ public class DispatchController : ControllerBase, IDisposable
                 documentImportOptions: documentImportOptions,
                 planner: planner,
                 logger: logger),
-            nameof(ChatSkill));
+            nameof(ChatSkill));*/
 
-        // Dispatch skill
-        this._kernel.ImportSkill(new DispatchSkills(), nameof(DispatchSkills));
+        // Image skill
+        this._kernel.ImportSkill(new ImageSkills(), nameof(ImageSkills));
+
+        // Render skill
+        this._kernel.ImportSkill(new RenderSkills(), nameof(RenderSkills));
     }
 
     [Authorize]
@@ -79,7 +104,7 @@ public class DispatchController : ControllerBase, IDisposable
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<IActionResult> DispatchAsync(
-        [FromServices] CopilotChatPlanner planner,
+        [FromServices] IKernel appKernel,
         [FromBody] Ask ask,
         [FromHeader] OpenApiSkillsAuthHeaders openApiSkillsAuthHeaders)
     {
@@ -92,39 +117,75 @@ public class DispatchController : ControllerBase, IDisposable
             contextVariables.Set(input.Key, input.Value);
         }
 
+        // Import plug-in skills on the fly because we can only register them with auth headers
+        await this.RegisterPlannerSkillsAsync(this._kernel, openApiSkillsAuthHeaders, contextVariables);
+
         // Create a sequential planner with proper skill scope. It will figure out which skill to call next.
         // TODO: Would it be annoying in this use case if ask user confirmation everytime?
         // Question: When to clone a context, when not to?
-
         try
         {
-            var plan = await this._planner.CreatePlanAsync(ask.Input);
+            var goal = $"Provide a friendly reponse or fullfill '{ask.Input}'. Reach out to external APIs if capable, otherwise use ChatSkill. Then use the reponse as an input to find a proper renderer method. Stop creating steps once used a renderer.";
+            var plan = await this._planner.CreatePlanAsync(goal);
             // contextVariables.Set("action", plan.ToJson());
             Console.WriteLine($"{plan.ToJson(true)}");
             // contextVariables.Update(plan.ToJson(true));
 
-            // TODO: Invoke the plan.
-            /* 
-            if (action.Contains('.', StringComparison.Ordinal))
+            // Manaully filter empty steps in the plan
+            var filteredPlanSteps = plan.Steps.Where(step => !string.IsNullOrEmpty(step.Name)).ToList<Plan>();
+
+            // Manually remove rendering step if that is the only remaining step. :(
+            // Question: How should I update my prompt to make the model/planner do this for me?
+            if (filteredPlanSteps.Count == 1 && filteredPlanSteps.ElementAt(0).Name == "RenderText")
             {
-                var parts = action.Split('.');
-                functionOrPlan = context.Skills!.GetFunction(parts[0], parts[1]);
+                filteredPlanSteps.RemoveAt(0);
+            }
+
+            // invoke chat function as the fallback skill
+            ISKFunction? chatFunction = null;
+            if (filteredPlanSteps.Count == 0)
+            {
+                try
+                {
+                    chatFunction = appKernel.Skills.GetFunction("ChatSkill", "Chat");
+                    SKContext result = await appKernel.RunAsync(contextVariables, chatFunction);
+
+                    return this.Ok(new AskResult { Value = result.Result, Variables = result.Variables.Select(v => new KeyValuePair<string, string>(v.Key, v.Value)) });
+                }
+                catch (KernelException ke)
+                {
+                    this._logger.LogError("Failed to find ChatSkill.Chat on server: {0}", ke);
+
+                    return this.NotFound($"Failed to find ChatSkill.Chat on server");
+                }
             }
             else
             {
-                functionOrPlan = context.Skills!.GetFunction(action);
+                var clonedPlan = new Plan(goal, steps: filteredPlanSteps.ToArray<Plan>());
+
+                // TODO: Invoke the plan.
+                /* 
+                if (action.Contains('.', StringComparison.Ordinal))
+                {
+                    var parts = action.Split('.');
+                    functionOrPlan = context.Skills!.GetFunction(parts[0], parts[1]);
+                }
+                else
+                {
+                    functionOrPlan = context.Skills!.GetFunction(action);
+                }
+                */
+
+                // TODO: Do we need to store the plan in memory?
+                /*await context.Memory.SaveInformationAsync(
+                    collection: $"{chatId}-LearningSkill.LessonPlans",
+                    text: plan.ToJson(true),
+                    id: Guid.NewGuid().ToString(),
+                    description: $"Plan for '{ask.Input}'",
+                    additionalMetadata: plan.ToJson());*/
+
+                return this.Ok(new AskResult { Value = clonedPlan.ToJson(true) });
             }
-            */
-
-            // TODO: Do we need to store the plan in memory?
-            /*await context.Memory.SaveInformationAsync(
-                collection: $"{chatId}-LearningSkill.LessonPlans",
-                text: plan.ToJson(true),
-                id: Guid.NewGuid().ToString(),
-                description: $"Plan for '{ask.Input}'",
-                additionalMetadata: plan.ToJson());*/
-
-            return this.Ok(plan.ToJson(true));
         }
 #pragma warning disable CA1031 // Do not catch general exception types
         catch (Exception e)
@@ -154,6 +215,16 @@ public class DispatchController : ControllerBase, IDisposable
         {
             // Question: IKernel doesn't have Dispose(), while Kernel is disposable?!
             // this._kernel.Dispose();
+
+            this._graphLoggingHandler?.Dispose();
+
+            if (this._graphMiddlewareHandlers != null)
+            {
+                foreach (IDisposable disposable in this._graphMiddlewareHandlers!)
+                {
+                    disposable.Dispose();
+                }
+            }
         }
     }
 
@@ -178,5 +249,76 @@ public class DispatchController : ControllerBase, IDisposable
         }
 
         return kernelConfig;
+    }
+
+    /// <summary>
+    /// Register plug-in skills
+    /// Note: This is a duplication function from the ChatController.cs
+    /// </summary>
+    private async Task RegisterPlannerSkillsAsync(IKernel kernel, OpenApiSkillsAuthHeaders openApiSkillsAuthHeaders, ContextVariables variables)
+    {
+        // Register authenticated skills with the planner's kernel only if the request includes an auth header for the skill.
+
+        // Klarna Shopping
+        if (openApiSkillsAuthHeaders.KlarnaAuthentication != null)
+        {
+            // Register the Klarna shopping ChatGPT plugin with the planner's kernel.
+            using DefaultHttpRetryHandler retryHandler = new(new HttpRetryConfig(), this._logger)
+            {
+                InnerHandler = new HttpClientHandler() { CheckCertificateRevocationList = true }
+            };
+            using HttpClient importHttpClient = new(retryHandler, false);
+            importHttpClient.DefaultRequestHeaders.Add("User-Agent", "Microsoft.CopilotChat");
+            await kernel.ImportChatGptPluginSkillFromUrlAsync("KlarnaShoppingSkill", new Uri("https://www.klarna.com/.well-known/ai-plugin.json"),
+                importHttpClient);
+        }
+
+        // GitHub
+        if (!string.IsNullOrWhiteSpace(openApiSkillsAuthHeaders.GithubAuthentication))
+        {
+            this._logger.LogInformation("Enabling GitHub skill.");
+            BearerAuthenticationProvider authenticationProvider = new(() => Task.FromResult(openApiSkillsAuthHeaders.GithubAuthentication));
+            await kernel.ImportOpenApiSkillFromFileAsync(
+                skillName: "GitHubSkill",
+                filePath: Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "CopilotChat", "Skills", "OpenApiSkills/GitHubSkill/openapi.json"),
+                authCallback: authenticationProvider.AuthenticateRequestAsync);
+        }
+
+        // Jira
+        if (!string.IsNullOrWhiteSpace(openApiSkillsAuthHeaders.JiraAuthentication))
+        {
+            this._logger.LogInformation("Registering Jira Skill");
+            var authenticationProvider = new BasicAuthenticationProvider(() => { return Task.FromResult(openApiSkillsAuthHeaders.JiraAuthentication); });
+            var hasServerUrlOverride = variables.Get("jira-server-url", out string serverUrlOverride);
+
+            await kernel.ImportOpenApiSkillFromFileAsync(
+                skillName: "JiraSkill",
+                filePath: Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!, "CopilotChat", "Skills", "OpenApiSkills/JiraSkill/openapi.json"),
+                authCallback: authenticationProvider.AuthenticateRequestAsync,
+                serverUrlOverride: hasServerUrlOverride ? new Uri(serverUrlOverride) : null);
+        }
+
+        // Microsoft Graph
+        if (!string.IsNullOrWhiteSpace(openApiSkillsAuthHeaders.GraphAuthentication))
+        {
+            this._logger.LogInformation("Enabling Microsoft Graph skill(s).");
+            BearerAuthenticationProvider authenticationProvider = new(() => Task.FromResult(openApiSkillsAuthHeaders.GraphAuthentication));
+
+            if (this._graphMiddlewareHandlers != null)
+            {
+                this._graphMiddlewareHandlers =
+                GraphClientFactory.CreateDefaultHandlers(new DelegateAuthenticationProvider(authenticationProvider.AuthenticateRequestAsync));
+                this._graphMiddlewareHandlers.Add(this._graphLoggingHandler);
+
+                using (HttpClient graphHttpClient = GraphClientFactory.Create(this._graphMiddlewareHandlers))
+                {
+                    GraphServiceClient graphServiceClient = new(graphHttpClient);
+
+                    kernel.ImportSkill(new TaskListSkill(new MicrosoftToDoConnector(graphServiceClient)), "todo");
+                    kernel.ImportSkill(new CalendarSkill(new OutlookCalendarConnector(graphServiceClient)), "calendar");
+                    kernel.ImportSkill(new EmailSkill(new OutlookMailConnector(graphServiceClient)), "email");
+                }
+            }
+        }
     }
 }

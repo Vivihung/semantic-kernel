@@ -178,9 +178,9 @@ public class ChatSkill
     /// </summary>
     /// <param name="message"></param>
     /// <param name="context">Contains the 'tokenLimit' and the 'contextTokenLimit' controlling the length of the prompt.</param>
-    [SKFunction("Get chat response")]
+    [SKFunction("Generate text response to the input message")]
     [SKFunctionName("Chat")]
-    [SKFunctionInput(Description = "The new message")]
+    [SKFunctionInput(Description = "The input message")]
     [SKFunctionContextParameter(Name = "userId", Description = "Unique and persistent identifier for the user")]
     [SKFunctionContextParameter(Name = "userName", Description = "Name of the user")]
     [SKFunctionContextParameter(Name = "chatId", Description = "Unique and persistent identifier for the chat")]
