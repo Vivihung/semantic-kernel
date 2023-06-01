@@ -141,10 +141,10 @@ public class DispatchController : ControllerBase, IDisposable
                 filteredPlanSteps.RemoveAt(0);
             }
 
-            // invoke chat function as the fallback skill
             ISKFunction? chatFunction = null;
             if (filteredPlanSteps.Count == 0)
             {
+                // invoke chat function as the fallback skill
                 try
                 {
                     chatFunction = appKernel.Skills.GetFunction("ChatSkill", "Chat");
@@ -161,22 +161,14 @@ public class DispatchController : ControllerBase, IDisposable
             }
             else
             {
+                // Execute the plan with filtered steps.
                 var clonedPlan = new Plan(goal, steps: filteredPlanSteps.ToArray<Plan>());
 
-                // TODO: Invoke the plan.
-                /* 
-                if (action.Contains('.', StringComparison.Ordinal))
-                {
-                    var parts = action.Split('.');
-                    functionOrPlan = context.Skills!.GetFunction(parts[0], parts[1]);
-                }
-                else
-                {
-                    functionOrPlan = context.Skills!.GetFunction(action);
-                }
-                */
+                // Invoke the plan.
+                // Questions: Do we need user's approval for this type of dispatch? I don't feel it's necessary. However, when shall we surface the confirmation to empower human in the loop?
+                // var completion = await clonedPlan.InvokeAsync();
 
-                // TODO: Do we need to store the plan in memory?
+                // Question: Do we need to store the plan in memory?
                 /*await context.Memory.SaveInformationAsync(
                     collection: $"{chatId}-LearningSkill.LessonPlans",
                     text: plan.ToJson(true),
@@ -184,7 +176,7 @@ public class DispatchController : ControllerBase, IDisposable
                     description: $"Plan for '{ask.Input}'",
                     additionalMetadata: plan.ToJson());*/
 
-                return this.Ok(new AskResult { Value = clonedPlan.ToJson(true) });
+                return this.Ok(new AskResult { Value = clonedPlan.ToJson(true)/*, Variables = completion.Variables.Select(v => new KeyValuePair<string, string>(v.Key, v.Value))*/ });
             }
         }
 #pragma warning disable CA1031 // Do not catch general exception types
