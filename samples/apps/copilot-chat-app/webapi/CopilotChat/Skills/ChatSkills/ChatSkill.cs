@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text.Json;
@@ -192,54 +193,68 @@ public class ChatSkill
         var userName = context["userName"];
         var chatId = context["chatId"];
 
-        // Save this new message to memory such that subsequent chat responses can use it
-        try
-        {
-            await this.SaveNewMessageAsync(message, userId, userName, chatId);
-        }
-        catch (Exception ex) when (!ex.IsCriticalException())
-        {
-            context.Log.LogError("Unable to save new message: {0}", ex.Message);
-            context.Fail($"Unable to save new message: {ex.Message}", ex);
-            return context;
-        }
+        var tasks = new List<Task>();
 
-        // Clone the context to avoid modifying the original context variables.
+        // Save this new message to memory such that subsequent chat responses can use it
+        tasks.Add(Task.Run(async () =>
+        {
+            try
+            {
+                await this.SaveNewMessageAsync(message, userId, userName, chatId);
+            }
+            catch (Exception ex) when (!ex.IsCriticalException())
+            {
+                context.Log.LogError("Unable to save new message: {0}", ex.Message);
+                context.Fail($"Unable to save new message: {ex.Message}", ex);
+                throw ex;
+            }
+        }));
+
         var chatContext = Utilities.CopyContextWithVariablesClone(context);
         chatContext.Variables.Set("knowledgeCutoff", this._promptOptions.KnowledgeCutoffDate);
         chatContext.Variables.Set("audience", chatContext["userName"]);
 
-        var response = chatContext.Variables.ContainsKey("userCancelledPlan")
-            ? "I am sorry the plan did not meet your goals."
-            : await this.GetChatResponseAsync(chatContext);
-
-        if (chatContext.ErrorOccurred)
+        // Clone the context to avoid modifying the original context variables.
+        tasks.Add(Task.Run(async () =>
         {
-            context.Fail(chatContext.LastErrorDescription);
-            return context;
-        }
+            var response = chatContext.Variables.ContainsKey("userCancelledPlan")
+                ? "I am sorry the plan did not meet your goals."
+                : await this.GetChatResponseAsync(chatContext);
 
-        // Save this response to memory such that subsequent chat responses can use it
-        try
-        {
-            await this.SaveNewResponseAsync(response, chatId);
-        }
-        catch (Exception ex) when (!ex.IsCriticalException())
-        {
-            context.Log.LogError("Unable to save new response: {0}", ex.Message);
-            context.Fail($"Unable to save new response: {ex.Message}");
-            return context;
-        }
+            if (chatContext.ErrorOccurred)
+            {
+                context.Fail(chatContext.LastErrorDescription);
+            }
 
-        // Extract semantic chat memory
-        await SemanticChatMemoryExtractor.ExtractSemanticChatMemoryAsync(
+            // Save this response to memory such that subsequent chat responses can use it
+            try
+            {
+                await this.SaveNewResponseAsync(response, chatId);
+            }
+            catch (Exception ex) when (!ex.IsCriticalException())
+            {
+                context.Log.LogError("Unable to save new response: {0}", ex.Message);
+                context.Fail($"Unable to save new response: {ex.Message}");
+                throw ex;
+            }
+
+            context.Variables.Update(response);
+        }));
+
+        // Extract semantic chat memory in another thread
+        _ = Task.Run(async () =>
+        {
+            await SemanticChatMemoryExtractor.ExtractSemanticChatMemoryAsync(
             chatId,
             this._kernel,
             chatContext,
             this._promptOptions);
+        });
 
-        context.Variables.Update(response);
         context.Variables.Set("userId", "Bot");
+
+        await Task.WhenAll(tasks);
+
         return context;
     }
 
