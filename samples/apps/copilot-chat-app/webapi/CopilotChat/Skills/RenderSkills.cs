@@ -13,7 +13,7 @@ public class RenderSkills
     [SKFunctionName("RenderImage")]
     public async Task<SKContext> RenderImageAsync(SKContext context)
     {
-        Console.WriteLine("Render an impage.");
+        Console.WriteLine("Render an image.");
 
         return await Task.FromResult<SKContext>(context);
     }
@@ -41,6 +41,15 @@ public class RenderSkills
     public async Task<SKContext> RenderPersonAsync(SKContext context)
     {
         Console.WriteLine("Rendering a person.");
+
+        return await Task.FromResult<SKContext>(context);
+    }
+
+    [SKFunction("Render program code")]
+    [SKFunctionName("RenderCode")]
+    public async Task<SKContext> RenderCodeAsync(SKContext context)
+    {
+        Console.WriteLine("Rendering code.");
 
         return await Task.FromResult<SKContext>(context);
     }
