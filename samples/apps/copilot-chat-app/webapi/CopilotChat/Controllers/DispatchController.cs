@@ -156,7 +156,7 @@ public class DispatchController : ControllerBase, IDisposable
                 {
                     this._logger.LogError("Failed to find ChatSkill.Chat on server: {0}", ke);
 
-                    return this.NotFound($"Failed to find ChatSkill.Chat on server");
+                    return this.NotFound("Failed to find ChatSkill.Chat on server");
                 }
             }
             else
